@@ -3,236 +3,531 @@ import json
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from flask import Flask, render_template, request, jsonify, session
-import psycopg2
-from psycopg2.extras import RealDictCursor
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify
+from googleapiclient.discovery import build
 import requests
+import sqlite3
+import re
 from threading import Thread
 import time
-from googleapiclient.discovery import build
+from collections import defaultdict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.secret_key = os.getenv('SECRET_KEY', 'telugu_cinema_2025')
+app.secret_key = 'telugu_cinema_monitor_2025'
 
 # Configuration
 CONFIG = {
-    'DATABASE_URL': os.getenv('DATABASE_URL'),
     'YOUTUBE_API_KEY': os.getenv('YOUTUBE_API_KEY'),
     'TELEGRAM_BOT_TOKEN': os.getenv('TELEGRAM_BOT_TOKEN'),
     'TELEGRAM_CHANNEL_ID': os.getenv('TELEGRAM_CHANNEL_ID'),
-    'ADMIN_PASSWORD': os.getenv('ADMIN_PASSWORD', 'admin123'),
-    'MONITORING_INTERVAL': int(os.getenv('MONITORING_INTERVAL', '1800')),  # 30 minutes
-    'AUTO_POST_THRESHOLD': int(os.getenv('AUTO_POST_THRESHOLD', '4')),
+    'ADMIN_USERNAME': os.getenv('ADMIN_USERNAME', 'admin'),
+    'ADMIN_PASSWORD': os.getenv('ADMIN_PASSWORD', 'password123'),
+    'MONITORING_INTERVAL': 1800,  # 30 minutes
+    'AUTO_POST_THRESHOLD': 5,  # Only 5/5 priority auto-posted
+    'MONITORING_DAYS': 2,  # Only last 2 days
+    'MAX_RESULTS_PER_SEARCH': 25,
 }
 
 class TeluguCinemaMonitor:
     def __init__(self):
-        self.youtube = build('youtube', 'v3', developerKey=CONFIG['YOUTUBE_API_KEY']) if CONFIG['YOUTUBE_API_KEY'] else None
+        self.youtube = None
+        self.api_quota_used = 0
+        self.max_daily_quota = 10000
+        self.quota_reset_time = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        self.last_check = datetime.now() - timedelta(days=1)
         self.init_database()
+        self.init_youtube_api()
         
-        # Official Telugu Cinema Channels (verified/popular channels only)
+        # Official Telugu cinema channels and their verified status
         self.official_channels = {
-            'UC_x5XG1OV2P6uZZ5FSM9Ttw': 'Hombale Films',  # KGF, Salaar
-            'UCjvgGbPPn-FgYeguc5nxG4A': 'Mythri Movie Makers',
-            'UC-BUw1VrHKdKOZgp1Rqmriw': 'Sri Venkateswara Creations',
-            'UCZZeT5u8GqR8HbQYWhjBXhw': 'Geetha Arts',
-            'UCzf38Rf8FY_DaT8wLZJa4-g': 'UV Creations',
-            'UC9EI99s4Zr_4zxHu7Qk6d9w': 'Red Giant Movies',
-            'UCq8LlzB3x7pNB5WD1U9WxnQ': 'T-Series Telugu',
-            'UC3tNpTOHsTnkmbwztCs30sA': 'Sony Music South',
-            'UCr6HBKTtBMd7LdaAOTN1xgw': 'Saregama Telugu',
-            'UCLwmGpYbpzDwelJNwFfT-Fg': 'AHA Video',
-            'UCNjjYDKQ1xOoF94-rttBrng': 'Aha Telugu',
+            # Major Production Houses
+            'UC-_5Lj_yajKrEhvt8LQ3Jw': {'name': 'AahaSTV', 'type': 'official', 'priority_boost': 2},
+            'UCi7xZmd_NqwLCOZzrAGIFgg': {'name': 'T-Series Telugu', 'type': 'official', 'priority_boost': 2},
+            'UCLm_u6TnJhw2tRvmJO7bIBQ': {'name': 'Aditya Music', 'type': 'official', 'priority_boost': 2},
+            'UCPkIkiODGDAhJdSJmVa1JYg': {'name': 'Lahari Music', 'type': 'official', 'priority_boost': 2},
+            'UC-1NMppIgk8q6BYlVqXeT6A': {'name': 'Mango Music', 'type': 'official', 'priority_boost': 2},
+            'UCGbVb0bMxKtBSjFKlhSJ7mw': {'name': 'Saregama Telugu', 'type': 'official', 'priority_boost': 2},
+            'UCQSf3-xEzYLy5n-Gq_XNZFQ': {'name': 'Sony Music South', 'type': 'official', 'priority_boost': 2},
+            'UCT7njX_vUGPg8SzXkamcPow': {'name': 'Jio Studios', 'type': 'official', 'priority_boost': 2},
+            'UCCb3E3_GIlJJBPRyNBAYG4g': {'name': 'Mythri Movie Makers', 'type': 'official', 'priority_boost': 2},
+            'UC_L7SzQFgRH9nVOe2cJ7hqw': {'name': 'Haarika & Hassine Creations', 'type': 'official', 'priority_boost': 2},
+            'UCNOJlqxaZz5Oy5Uw3LjKTpg': {'name': 'Geetha Arts', 'type': 'official', 'priority_boost': 2},
+            'UCYq5VPOOx6Kd8vwCEoL5GcQ': {'name': 'Dil Raju Productions', 'type': 'official', 'priority_boost': 2},
+            'UCr7nk_DPTQ4W7Rg8g4Z7X-Q': {'name': 'UV Creations', 'type': 'official', 'priority_boost': 2},
+            
+            # Major News Channels
+            'UCfQmN8u4LKpv6YdngOyLM8g': {'name': 'TV9 Telugu', 'type': 'news', 'priority_boost': 1},
+            'UCMhq23LMNgzJJCr7K1h9lTQ': {'name': 'ABN Telugu', 'type': 'news', 'priority_boost': 1},
+            'UC3EhhhvODy4GQHOOpxNdSnQ': {'name': 'V6 News Telugu', 'type': 'news', 'priority_boost': 1},
+            'UCLCkOhQ3zq4VAhLPQFcS1VA': {'name': 'Sakshi TV', 'type': 'news', 'priority_boost': 1},
+            'UC34HtHEkLIgKnU3PKvJKiJw': {'name': 'NTV Telugu', 'type': 'news', 'priority_boost': 1},
+            'UCLqBdTEn_9M-2E7GZHGnqMg': {'name': 'Studio One', 'type': 'news', 'priority_boost': 1},
+            
+            # Entertainment Channels
+            'UCp1tiJTtdB_qOqhJhIJ4Ygg': {'name': 'Gemini TV', 'type': 'entertainment', 'priority_boost': 1},
+            'UC1yKCHDaAjQMl-vqH0Dz_Zw': {'name': 'ETV Plus', 'type': 'entertainment', 'priority_boost': 1},
+            'UCt0Q8L2CJ99YMU3Jbm1hLWA': {'name': 'Star Maa', 'type': 'entertainment', 'priority_boost': 1},
+            'UCb6oYbCIzGe4R7RmXI7qmRA': {'name': 'Zee Telugu', 'type': 'entertainment', 'priority_boost': 1},
+            
+            # Box Office & Analysis
+            'UCfgArb5-TgW9N0m7vF3mjTg': {'name': 'Great Andhra', 'type': 'analysis', 'priority_boost': 1},
+            'UCsVMjJRd-RxJIDYJYmvR3LA': {'name': 'Telugu Cinema', 'type': 'analysis', 'priority_boost': 1},
         }
         
-        # Content categories with enhanced priority system
-        self.categories = {
-            'trailer': {'keywords': ['trailer', 'official trailer'], 'priority': 5},
-            'teaser': {'keywords': ['teaser', 'first look'], 'priority': 5},
-            'song': {'keywords': ['song', 'lyrical', 'video song'], 'priority': 4},
-            'news': {'keywords': ['news', 'breaking', 'announcement'], 'priority': 3},
-            'interview': {'keywords': ['interview', 'exclusive'], 'priority': 2},
+        # Enhanced Telugu keywords with official markers
+        self.telugu_keywords = [
+            'telugu movie official trailer',
+            'telugu movie official teaser', 
+            'tollywood official trailer',
+            'telugu film official',
+            'telugu movie first look',
+            'telugu box office collection',
+            'tollywood news today',
+            'telugu movie review',
+            'telugu songs official',
+            'telugu cinema news',
+        ]
+        
+        # Content categories with refined priority system
+        self.content_categories = {
+            'official_trailer': {'keywords': ['official trailer', 'theatrical trailer'], 'priority': 5},
+            'official_teaser': {'keywords': ['official teaser', 'first look', 'title teaser'], 'priority': 5},
+            'official_song': {'keywords': ['full video song', 'lyrical song', 'official video song'], 'priority': 4},
+            'box_office': {'keywords': ['box office', 'collection', 'day 1 collection', 'opening day'], 'priority': 4},
+            'breaking_news': {'keywords': ['breaking news', 'exclusive', 'confirmed'], 'priority': 4},
+            'movie_review': {'keywords': ['movie review', 'rating', 'critics review'], 'priority': 3},
+            'audio_launch': {'keywords': ['audio launch', 'music launch', 'pre release'], 'priority': 3},
+            'interview': {'keywords': ['interview', 'exclusive interview'], 'priority': 2},
+            'behind_scenes': {'keywords': ['making', 'behind the scenes', 'bts'], 'priority': 2},
+            'other': {'keywords': [], 'priority': 1}
         }
 
     def init_database(self):
-        """Initialize PostgreSQL database"""
-        conn = psycopg2.connect(CONFIG['DATABASE_URL'])
-        cur = conn.cursor()
+        """Initialize SQLite database with enhanced schema"""
+        conn = sqlite3.connect('telugu_cinema.db')
+        cursor = conn.cursor()
         
-        cur.execute('''
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS videos (
-                id VARCHAR(20) PRIMARY KEY,
-                title TEXT NOT NULL,
-                channel_id VARCHAR(50) NOT NULL,
-                channel_name VARCHAR(100) NOT NULL,
-                published_at TIMESTAMP NOT NULL,
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                channel TEXT,
+                channel_id TEXT,
+                published_at TEXT,
+                description TEXT,
                 thumbnail TEXT,
-                view_count BIGINT DEFAULT 0,
-                category VARCHAR(20) NOT NULL,
-                priority INTEGER NOT NULL,
+                view_count INTEGER DEFAULT 0,
+                like_count INTEGER DEFAULT 0,
+                comment_count INTEGER DEFAULT 0,
+                category TEXT,
+                priority INTEGER,
+                is_official_source BOOLEAN DEFAULT FALSE,
+                channel_type TEXT,
                 sent_to_telegram BOOLEAN DEFAULT FALSE,
+                admin_approved BOOLEAN DEFAULT FALSE,
                 auto_posted BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT NOW()
+                verification_score INTEGER DEFAULT 0,
+                engagement_rate REAL DEFAULT 0.0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        cur.execute('''
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS monitoring_stats (
-                id SERIAL PRIMARY KEY,
-                date DATE DEFAULT CURRENT_DATE,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT,
                 videos_found INTEGER DEFAULT 0,
+                official_videos INTEGER DEFAULT 0,
                 auto_posted INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT NOW()
+                manual_posted INTEGER DEFAULT 0,
+                api_calls INTEGER DEFAULT 0,
+                quota_used INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        # Create indexes for better performance
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id)')
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_videos_priority ON videos(priority DESC)')
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_videos_sent ON videos(sent_to_telegram)')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS api_quota_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation TEXT,
+                quota_cost INTEGER,
+                total_used INTEGER,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Add new columns if they don't exist
+        try:
+            cursor.execute('ALTER TABLE videos ADD COLUMN channel_id TEXT')
+            cursor.execute('ALTER TABLE videos ADD COLUMN is_official_source BOOLEAN DEFAULT FALSE')
+            cursor.execute('ALTER TABLE videos ADD COLUMN channel_type TEXT')
+            cursor.execute('ALTER TABLE videos ADD COLUMN verification_score INTEGER DEFAULT 0')
+            cursor.execute('ALTER TABLE videos ADD COLUMN engagement_rate REAL DEFAULT 0.0')
+            cursor.execute('ALTER TABLE videos ADD COLUMN comment_count INTEGER DEFAULT 0')
+            cursor.execute('ALTER TABLE monitoring_stats ADD COLUMN official_videos INTEGER DEFAULT 0')
+            cursor.execute('ALTER TABLE monitoring_stats ADD COLUMN quota_used INTEGER DEFAULT 0')
+        except sqlite3.OperationalError:
+            pass  # Columns already exist
         
         conn.commit()
         conn.close()
 
-    def categorize_content(self, title):
-        """Categorize content and assign priority"""
-        title_lower = title.lower()
-        
-        for category, data in self.categories.items():
-            if any(keyword in title_lower for keyword in data['keywords']):
-                return category, data['priority']
-        
-        return 'other', 1
+    def init_youtube_api(self):
+        """Initialize YouTube API with quota tracking"""
+        if CONFIG['YOUTUBE_API_KEY']:
+            try:
+                self.youtube = build('youtube', 'v3', developerKey=CONFIG['YOUTUBE_API_KEY'])
+                logger.info("YouTube API initialized successfully")
+                self.reset_daily_quota_if_needed()
+            except Exception as e:
+                logger.error(f"Failed to initialize YouTube API: {e}")
 
-    def get_channel_videos(self, channel_id, max_results=10):
-        """Get recent videos from a specific channel"""
-        if not self.youtube:
-            return []
+    def reset_daily_quota_if_needed(self):
+        """Reset quota if new day started"""
+        now = datetime.now()
+        if now >= self.quota_reset_time:
+            self.api_quota_used = 0
+            self.quota_reset_time = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+            logger.info("Daily API quota reset")
+
+    def log_api_usage(self, operation, cost):
+        """Log API usage for tracking"""
+        self.api_quota_used += cost
         
-        try:
-            # Get videos from last 24 hours
-            published_after = (datetime.utcnow() - timedelta(days=1)).isoformat() + 'Z'
+        conn = sqlite3.connect('telugu_cinema.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO api_quota_log (operation, quota_cost, total_used)
+            VALUES (?, ?, ?)
+        ''', (operation, cost, self.api_quota_used))
+        conn.commit()
+        conn.close()
+
+    def is_official_channel(self, channel_id):
+        """Check if channel is official"""
+        return channel_id in self.official_channels
+
+    def get_channel_info(self, channel_id):
+        """Get channel information and verification status"""
+        if channel_id in self.official_channels:
+            return self.official_channels[channel_id]
+        return {'name': 'Unknown', 'type': 'unofficial', 'priority_boost': 0}
+
+    def calculate_verification_score(self, video_data):
+        """Calculate verification score based on multiple factors"""
+        score = 0
+        
+        # Official channel boost
+        if video_data.get('is_official_source', False):
+            score += 50
+        
+        # Subscriber count (if available)
+        # Note: Would need additional API call to get subscriber count
+        
+        # Engagement metrics
+        view_count = video_data.get('view_count', 0)
+        like_count = video_data.get('like_count', 0)
+        comment_count = video_data.get('comment_count', 0)
+        
+        if view_count > 0:
+            engagement_rate = (like_count + comment_count) / view_count
+            video_data['engagement_rate'] = engagement_rate
             
-            search_response = self.youtube.search().list(
-                channelId=channel_id,
-                part='id,snippet',
-                type='video',
-                order='date',
-                publishedAfter=published_after,
-                maxResults=max_results
-            ).execute()
-            
-            videos = []
-            video_ids = [item['id']['videoId'] for item in search_response['items']]
-            
-            if video_ids:
-                # Get video statistics
-                stats_response = self.youtube.videos().list(
-                    part='statistics',
-                    id=','.join(video_ids)
+            if engagement_rate > 0.01:  # 1% engagement
+                score += 20
+            elif engagement_rate > 0.005:  # 0.5% engagement
+                score += 10
+        
+        # Title quality (official markers)
+        title_lower = video_data.get('title', '').lower()
+        official_markers = ['official', 'trailer', 'teaser', 'first look', 'exclusive']
+        score += sum(10 for marker in official_markers if marker in title_lower)
+        
+        return min(score, 100)  # Cap at 100
+
+    def categorize_content(self, title, description=""):
+        """Enhanced content categorization"""
+        title_lower = title.lower()
+        desc_lower = description.lower()
+        text = f"{title_lower} {desc_lower}"
+        
+        # Check for official markers first
+        official_markers = ['official trailer', 'official teaser', 'official video', 'official song']
+        has_official_marker = any(marker in text for marker in official_markers)
+        
+        # Categorize based on content type
+        for category, data in self.content_categories.items():
+            for keyword in data['keywords']:
+                if keyword in text:
+                    priority = data['priority']
+                    if has_official_marker and category.startswith('official'):
+                        priority = 5  # Boost official content
+                    return category, priority
+        
+        return 'other', self.content_categories['other']['priority']
+
+    def calculate_final_priority(self, video_data):
+        """Calculate final priority with all factors"""
+        base_priority = video_data['priority']
+        
+        # Official source boost
+        if video_data.get('is_official_source', False):
+            channel_info = self.get_channel_info(video_data.get('channel_id', ''))
+            base_priority += channel_info.get('priority_boost', 0)
+        
+        # Verification score influence
+        verification_score = video_data.get('verification_score', 0)
+        if verification_score >= 80:
+            base_priority += 1
+        elif verification_score >= 60:
+            base_priority += 0.5
+        
+        # Recent content boost
+        pub_time = datetime.fromisoformat(video_data['published_at'].replace('Z', '+00:00'))
+        time_diff = datetime.now() - pub_time.replace(tzinfo=None)
+        if time_diff.total_seconds() < 3600:  # Within 1 hour
+            base_priority += 0.5
+        elif time_diff.total_seconds() < 21600:  # Within 6 hours
+            base_priority += 0.25
+        
+        # High engagement boost
+        engagement_rate = video_data.get('engagement_rate', 0)
+        if engagement_rate > 0.02:  # 2% engagement
+            base_priority += 0.5
+        elif engagement_rate > 0.01:  # 1% engagement
+            base_priority += 0.25
+        
+        return min(int(base_priority), 5)  # Cap at 5
+
+    def search_telugu_content(self):
+        """Enhanced search focusing on official sources"""
+        if not self.youtube:
+            logger.error("YouTube API not initialized")
+            return []
+
+        self.reset_daily_quota_if_needed()
+        
+        if self.api_quota_used >= self.max_daily_quota * 0.9:  # 90% quota used
+            logger.warning("API quota nearly exhausted, skipping search")
+            return []
+
+        all_videos = []
+        published_after = (datetime.now() - timedelta(days=CONFIG['MONITORING_DAYS'])).isoformat() + 'Z'
+        
+        # Search official channels first
+        for channel_id, channel_info in list(self.official_channels.items())[:10]:  # Limit channels
+            try:
+                search_response = self.youtube.search().list(
+                    channelId=channel_id,
+                    part='id,snippet',
+                    type='video',
+                    publishedAfter=published_after,
+                    maxResults=5,
+                    order='date'
                 ).execute()
                 
-                stats_dict = {item['id']: item['statistics'] for item in stats_response['items']}
+                self.log_api_usage(f"Channel search: {channel_info['name']}", 100)
                 
                 for item in search_response['items']:
-                    video_id = item['id']['videoId']
-                    snippet = item['snippet']
-                    stats = stats_dict.get(video_id, {})
-                    
-                    category, priority = self.categorize_content(snippet['title'])
-                    
-                    # Boost priority for official channels
-                    if priority >= 3:  # Only boost meaningful content
-                        priority = min(5, priority + 1)
-                    
-                    video_data = {
-                        'id': video_id,
-                        'title': snippet['title'],
-                        'channel_id': channel_id,
-                        'channel_name': snippet['channelTitle'],
-                        'published_at': snippet['publishedAt'],
-                        'thumbnail': snippet['thumbnails'].get('medium', {}).get('url', ''),
-                        'view_count': int(stats.get('viewCount', 0)),
-                        'category': category,
-                        'priority': priority
-                    }
-                    videos.append(video_data)
+                    video_data = self.extract_video_data(item, channel_id, channel_info)
+                    if video_data:
+                        all_videos.append(video_data)
+                
+                time.sleep(0.5)  # Rate limiting
+                
+            except Exception as e:
+                logger.error(f"Error searching channel {channel_info['name']}: {e}")
+                continue
+        
+        # Search by keywords for additional content
+        for keyword in self.telugu_keywords[:5]:  # Limit keywords
+            if self.api_quota_used >= self.max_daily_quota * 0.9:
+                break
+                
+            try:
+                search_response = self.youtube.search().list(
+                    q=keyword,
+                    part='id,snippet',
+                    type='video',
+                    publishedAfter=published_after,
+                    maxResults=CONFIG['MAX_RESULTS_PER_SEARCH'] // 5,
+                    order='relevance',
+                    regionCode='IN'
+                ).execute()
+                
+                self.log_api_usage(f"Keyword search: {keyword}", 100)
+                
+                for item in search_response['items']:
+                    channel_id = item['snippet']['channelId']
+                    channel_info = self.get_channel_info(channel_id)
+                    video_data = self.extract_video_data(item, channel_id, channel_info)
+                    if video_data:
+                        all_videos.append(video_data)
+                
+                time.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"Error searching keyword '{keyword}': {e}")
+                continue
+
+        # Remove duplicates and sort by priority
+        unique_videos = {v['id']: v for v in all_videos}.values()
+        sorted_videos = sorted(unique_videos, key=lambda x: (x['priority'], x['verification_score']), reverse=True)
+        
+        return list(sorted_videos)
+
+    def extract_video_data(self, item, channel_id, channel_info):
+        """Extract and enrich video data"""
+        try:
+            video_data = {
+                'id': item['id']['videoId'],
+                'title': item['snippet']['title'],
+                'channel': item['snippet']['channelTitle'],
+                'channel_id': channel_id,
+                'published_at': item['snippet']['publishedAt'],
+                'description': item['snippet']['description'],
+                'thumbnail': item['snippet']['thumbnails'].get('medium', {}).get('url', ''),
+                'is_official_source': self.is_official_channel(channel_id),
+                'channel_type': channel_info['type']
+            }
             
-            return videos
+            # Get detailed video statistics
+            video_stats = self.youtube.videos().list(
+                part='statistics',
+                id=video_data['id']
+            ).execute()
+            
+            self.log_api_usage("Video statistics", 1)
+            
+            if video_stats['items']:
+                stats = video_stats['items'][0]['statistics']
+                video_data.update({
+                    'view_count': int(stats.get('viewCount', 0)),
+                    'like_count': int(stats.get('likeCount', 0)),
+                    'comment_count': int(stats.get('commentCount', 0))
+                })
+            
+            # Categorize and prioritize
+            category, priority = self.categorize_content(video_data['title'], video_data['description'])
+            video_data.update({
+                'category': category,
+                'priority': priority
+            })
+            
+            # Calculate verification score
+            video_data['verification_score'] = self.calculate_verification_score(video_data)
+            
+            # Calculate final priority
+            video_data['priority'] = self.calculate_final_priority(video_data)
+            
+            return video_data
             
         except Exception as e:
-            logger.error(f"Error fetching videos for channel {channel_id}: {e}")
-            return []
+            logger.error(f"Error extracting video data: {e}")
+            return None
 
-    def monitor_channels(self):
-        """Monitor all official channels for new content"""
-        all_videos = []
-        
-        for channel_id, channel_name in self.official_channels.items():
-            videos = self.get_channel_videos(channel_id)
-            all_videos.extend(videos)
-            time.sleep(1)  # Rate limiting
-        
-        return sorted(all_videos, key=lambda x: x['priority'], reverse=True)
-
-    def save_new_videos(self, videos):
-        """Save new videos to database"""
-        conn = psycopg2.connect(CONFIG['DATABASE_URL'])
-        cur = conn.cursor()
+    def save_videos_to_db(self, videos):
+        """Save videos to database with enhanced data"""
+        conn = sqlite3.connect('telugu_cinema.db')
+        cursor = conn.cursor()
         
         new_videos = []
         
         for video in videos:
-            # Check if video exists
-            cur.execute('SELECT id FROM videos WHERE id = %s', (video['id'],))
-            if not cur.fetchone():
-                cur.execute('''
+            # Check if video already exists
+            cursor.execute('SELECT id FROM videos WHERE id = ?', (video['id'],))
+            if not cursor.fetchone():
+                cursor.execute('''
                     INSERT INTO videos 
-                    (id, title, channel_id, channel_name, published_at, thumbnail, 
-                     view_count, category, priority)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    (id, title, channel, channel_id, published_at, description, thumbnail, 
+                     view_count, like_count, comment_count, category, priority, 
+                     is_official_source, channel_type, verification_score, engagement_rate)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    video['id'], video['title'], video['channel_id'], 
-                    video['channel_name'], video['published_at'], video['thumbnail'],
-                    video['view_count'], video['category'], video['priority']
+                    video['id'], video['title'], video['channel'], video['channel_id'],
+                    video['published_at'], video['description'], video['thumbnail'],
+                    video.get('view_count', 0), video.get('like_count', 0), 
+                    video.get('comment_count', 0), video['category'], video['priority'],
+                    video.get('is_official_source', False), video.get('channel_type', 'unofficial'),
+                    video.get('verification_score', 0), video.get('engagement_rate', 0.0)
                 ))
                 new_videos.append(video)
         
         conn.commit()
         conn.close()
+        
         return new_videos
 
     def format_telegram_message(self, video):
-        """Format video for Telegram"""
-        emojis = {'trailer': '🎬', 'teaser': '📽️', 'song': '🎵', 'news': '📰', 'interview': '🎤'}
-        emoji = emojis.get(video['category'], '📺')
-        stars = '⭐' * video['priority']
+        """Enhanced Telegram message formatting"""
+        category_emojis = {
+            'official_trailer': '🎬',
+            'official_teaser': '📽️',
+            'official_song': '🎵',
+            'box_office': '💰',
+            'breaking_news': '🚨',
+            'movie_review': '⭐',
+            'audio_launch': '🎤',
+            'interview': '🎙️',
+            'behind_scenes': '🎭',
+            'other': '📺'
+        }
         
-        return f"""
-{emoji} *{video['category'].upper()}* | Telugu Cinema
-{stars} Priority: {video['priority']}/5
+        emoji = category_emojis.get(video['category'], '📺')
+        priority_stars = '⭐' * video['priority']
+        
+        # Official source indicator
+        official_badge = '✅ OFFICIAL' if video.get('is_official_source', False) else '📺 CHANNEL'
+        
+        # Format published time
+        pub_time = datetime.fromisoformat(video['published_at'].replace('Z', '+00:00'))
+        time_ago = datetime.now() - pub_time.replace(tzinfo=None)
+        
+        if time_ago.total_seconds() < 3600:
+            time_str = f"{int(time_ago.total_seconds() // 60)} minutes ago"
+        elif time_ago.total_seconds() < 86400:
+            time_str = f"{int(time_ago.total_seconds() // 3600)} hours ago"
+        else:
+            time_str = f"{time_ago.days} day(s) ago"
+        
+        # Engagement metrics
+        engagement_rate = video.get('engagement_rate', 0) * 100
+        verification_score = video.get('verification_score', 0)
+        
+        message = f"""
+{emoji} *{video['category'].replace('_', ' ').upper()}* | Telugu Cinema
+{priority_stars} Priority: {video['priority']}/5 | {official_badge}
 
 🎭 *{video['title']}*
 
-📺 {video['channel_name']}
-👀 Views: {video['view_count']:,}
+📺 Channel: {video['channel']}
+👀 Views: {video.get('view_count', 0):,}
+👍 Likes: {video.get('like_count', 0):,}
+💬 Comments: {video.get('comment_count', 0):,}
+📊 Engagement: {engagement_rate:.2f}%
+✅ Verification: {verification_score}/100
+⏰ {time_str}
 
 🔗 [Watch Now](https://youtube.com/watch?v={video['id']})
 
-#TeluguCinema #{video['category'].capitalize()} #Tollywood
+#TeluguCinema #{video['category'].replace('_', '').capitalize()} #Tollywood #Priority{video['priority']}
         """.strip()
+        
+        return message
 
-    def send_to_telegram(self, video):
-        """Send video to Telegram channel"""
+    def send_to_telegram(self, video, is_auto=True):
+        """Send video update to Telegram channel"""
         if not CONFIG['TELEGRAM_BOT_TOKEN'] or not CONFIG['TELEGRAM_CHANNEL_ID']:
+            logger.warning("Telegram credentials not configured")
             return False
         
-        url = f"https://api.telegram.org/bot{CONFIG['TELEGRAM_BOT_TOKEN']}/sendMessage"
         message = self.format_telegram_message(video)
+        
+        url = f"https://api.telegram.org/bot{CONFIG['TELEGRAM_BOT_TOKEN']}/sendMessage"
         
         payload = {
             'chat_id': CONFIG['TELEGRAM_CHANNEL_ID'],
@@ -244,167 +539,500 @@ class TeluguCinemaMonitor:
         try:
             response = requests.post(url, json=payload, timeout=10)
             if response.status_code == 200:
-                # Mark as sent
-                conn = psycopg2.connect(CONFIG['DATABASE_URL'])
-                cur = conn.cursor()
-                cur.execute('''
+                post_type = "automatically" if is_auto else "manually"
+                logger.info(f"Successfully sent video to Telegram ({post_type}): {video['title']}")
+                
+                # Mark as sent in database
+                conn = sqlite3.connect('telugu_cinema.db')
+                cursor = conn.cursor()
+                cursor.execute('''
                     UPDATE videos 
-                    SET sent_to_telegram = TRUE, auto_posted = TRUE 
-                    WHERE id = %s
-                ''', (video['id'],))
+                    SET sent_to_telegram = TRUE, auto_posted = ?, admin_approved = ?
+                    WHERE id = ?
+                ''', (is_auto, not is_auto, video['id']))
                 conn.commit()
                 conn.close()
                 
-                logger.info(f"Sent to Telegram: {video['title']}")
                 return True
-            return False
+            else:
+                logger.error(f"Failed to send to Telegram: {response.text}")
+                return False
+                
         except Exception as e:
-            logger.error(f"Telegram send error: {e}")
+            logger.error(f"Error sending to Telegram: {e}")
             return False
 
     def run_monitoring_cycle(self):
-        """Run complete monitoring cycle"""
-        logger.info("🔍 Starting monitoring cycle...")
+        """Enhanced monitoring cycle"""
+        logger.info("Starting monitoring cycle...")
         
         try:
-            # Monitor all channels
-            videos = self.monitor_channels()
-            new_videos = self.save_new_videos(videos)
+            # Check API quota
+            if self.api_quota_used >= self.max_daily_quota * 0.9:
+                logger.warning("API quota nearly exhausted, skipping monitoring")
+                return
             
-            # Auto-post high priority videos
-            auto_sent = 0
+            # Search for new videos
+            videos = self.search_telugu_content()
+            logger.info(f"Found {len(videos)} videos")
+            
+            # Save to database and get new ones
+            new_videos = self.save_videos_to_db(videos)
+            logger.info(f"Found {len(new_videos)} new videos")
+            
+            # Count official vs unofficial
+            official_count = sum(1 for v in new_videos if v.get('is_official_source', False))
+            
+            # Auto-post only priority 5 videos
+            auto_sent_count = 0
+            
             for video in new_videos:
                 if video['priority'] >= CONFIG['AUTO_POST_THRESHOLD']:
-                    if self.send_to_telegram(video):
-                        auto_sent += 1
+                    if self.send_to_telegram(video, is_auto=True):
+                        auto_sent_count += 1
                     time.sleep(3)  # Rate limiting
             
-            # Update stats
-            self.update_stats(len(new_videos), auto_sent)
+            # Update monitoring stats
+            self.update_monitoring_stats(len(videos), official_count, auto_sent_count, 0)
             
-            logger.info(f"✅ Cycle complete: {len(new_videos)} new, {auto_sent} auto-posted")
+            logger.info(f"Monitoring cycle completed. Found: {len(videos)}, Official: {official_count}, Auto-sent: {auto_sent_count}")
             
         except Exception as e:
-            logger.error(f"❌ Monitoring error: {e}")
+            logger.error(f"Error in monitoring cycle: {e}")
 
-    def update_stats(self, videos_found, auto_posted):
+    def update_monitoring_stats(self, videos_found, official_videos, auto_posted, manual_posted):
         """Update monitoring statistics"""
-        conn = psycopg2.connect(CONFIG['DATABASE_URL'])
-        cur = conn.cursor()
+        conn = sqlite3.connect('telugu_cinema.db')
+        cursor = conn.cursor()
         
-        cur.execute('''
-            INSERT INTO monitoring_stats (videos_found, auto_posted)
-            VALUES (%s, %s)
-            ON CONFLICT (date) DO UPDATE SET
-            videos_found = monitoring_stats.videos_found + %s,
-            auto_posted = monitoring_stats.auto_posted + %s
-        ''', (videos_found, auto_posted, videos_found, auto_posted))
+        today = datetime.now().strftime('%Y-%m-%d')
+        
+        cursor.execute('''
+            INSERT INTO monitoring_stats 
+            (date, videos_found, official_videos, auto_posted, manual_posted, api_calls, quota_used)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (today, videos_found, official_videos, auto_posted, manual_posted, 
+              self.api_quota_used, self.api_quota_used))
         
         conn.commit()
         conn.close()
 
+    def get_recent_videos(self, days=2):
+        """Get videos from last N days only"""
+        conn = sqlite3.connect('telugu_cinema.db')
+        cursor = conn.cursor()
+        
+        cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
+        
+        cursor.execute('''
+            SELECT * FROM videos 
+            WHERE published_at >= ? 
+            ORDER BY priority DESC, verification_score DESC, published_at DESC
+            LIMIT 50
+        ''', (cutoff_date,))
+        
+        videos = cursor.fetchall()
+        conn.close()
+        
+        return videos
+
+    def get_pending_videos(self):
+        """Get videos pending manual approval from last 2 days"""
+        conn = sqlite3.connect('telugu_cinema.db')
+        cursor = conn.cursor()
+        
+        cutoff_date = (datetime.now() - timedelta(days=CONFIG['MONITORING_DAYS'])).isoformat()
+        
+        cursor.execute('''
+            SELECT * FROM videos 
+            WHERE sent_to_telegram = FALSE 
+            AND published_at >= ?
+            AND priority < ?
+            ORDER BY is_official_source DESC, priority DESC, verification_score DESC, published_at DESC
+        ''', (cutoff_date, CONFIG['AUTO_POST_THRESHOLD']))
+        
+        videos = cursor.fetchall()
+        conn.close()
+        
+        return videos
+
+    def approve_and_send_video(self, video_id):
+        """Approve and send a video manually"""
+        conn = sqlite3.connect('telugu_cinema.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM videos WHERE id = ?', (video_id,))
+        video_data = cursor.fetchone()
+        conn.close()
+        
+        if not video_data:
+            return False, "Video not found"
+        
+        # Convert to dict
+        video = {
+            'id': video_data[0],
+            'title': video_data[1],
+            'channel': video_data[2],
+            'channel_id': video_data[3],
+            'published_at': video_data[4],
+            'description': video_data[5],
+            'thumbnail': video_data[6],
+            'view_count': video_data[7],
+            'like_count': video_data[8],
+            'comment_count': video_data[9],
+            'category': video_data[10],
+            'priority': video_data[11],
+            'is_official_source': bool(video_data[12]),
+            'channel_type': video_data[13],
+            'verification_score': video_data[17],
+            'engagement_rate': video_data[18]
+        }
+        
+        if self.send_to_telegram(video, is_auto=False):
+            # Update stats
+            self.update_monitoring_stats(0, 0, 0, 1)
+            return True, "Video sent successfully"
+        else:
+            return False, "Failed to send video"
+
     def get_dashboard_data(self):
-        """Get dashboard data"""
-        conn = psycopg2.connect(CONFIG['DATABASE_URL'], cursor_factory=RealDictCursor)
-        cur = conn.cursor()
+        """Get comprehensive dashboard data"""
+        conn = sqlite3.connect('telugu_cinema.db')
+        cursor = conn.cursor()
         
-        # Recent videos
-        cur.execute('''
-            SELECT * FROM videos 
-            ORDER BY published_at DESC 
-            LIMIT 20
-        ''')
-        recent_videos = cur.fetchall()
+        # Get recent videos (last 2 days only)
+        recent_videos = self.get_recent_videos(CONFIG['MONITORING_DAYS'])
         
-        # Pending approval (low priority videos)
-        cur.execute('''
-            SELECT * FROM videos 
-            WHERE sent_to_telegram = FALSE AND priority < %s
-            ORDER BY priority DESC, published_at DESC
-            LIMIT 10
-        ''', (CONFIG['AUTO_POST_THRESHOLD'],))
-        pending_videos = cur.fetchall()
+        # Get pending manual approval videos
+        pending_videos = self.get_pending_videos()
         
-        # Today's stats
-        cur.execute('''
-            SELECT 
-                COUNT(*) as total_today,
-                COUNT(CASE WHEN auto_posted = TRUE THEN 1 END) as auto_posted,
-                COUNT(CASE WHEN sent_to_telegram = FALSE AND priority < %s THEN 1 END) as pending
+        # Get today's statistics
+        today = datetime.now().strftime('%Y-%m-%d')
+        cutoff_date = (datetime.now() - timedelta(days=CONFIG['MONITORING_DAYS'])).isoformat()
+        
+        # Category statistics (last 2 days)
+        cursor.execute('''
+            SELECT category, COUNT(*) as count 
             FROM videos 
-            WHERE DATE(created_at) = CURRENT_DATE
-        ''', (CONFIG['AUTO_POST_THRESHOLD'],))
-        stats = cur.fetchone()
+            WHERE published_at >= ?
+            GROUP BY category
+            ORDER BY count DESC
+        ''', (cutoff_date,))
+        category_stats = dict(cursor.fetchall())
+        
+        # Priority distribution (last 2 days)
+        cursor.execute('''
+            SELECT priority, COUNT(*) as count 
+            FROM videos 
+            WHERE published_at >= ?
+            GROUP BY priority
+            ORDER BY priority DESC
+        ''', (cutoff_date,))
+        priority_stats = dict(cursor.fetchall())
+        
+        # Official vs Unofficial sources (last 2 days)
+        cursor.execute('''
+            SELECT 
+                COUNT(CASE WHEN is_official_source = 1 THEN 1 END) as official,
+                COUNT(CASE WHEN is_official_source = 0 THEN 1 END) as unofficial
+            FROM videos 
+            WHERE published_at >= ?
+        ''', (cutoff_date,))
+        source_stats = cursor.fetchone()
+        
+        # Posting statistics (last 2 days)
+        cursor.execute('''
+            SELECT 
+                COUNT(CASE WHEN auto_posted = 1 THEN 1 END) as auto_posted,
+                COUNT(CASE WHEN admin_approved = 1 THEN 1 END) as manual_posted,
+                COUNT(CASE WHEN sent_to_telegram = 0 THEN 1 END) as pending
+            FROM videos 
+            WHERE published_at >= ?
+        ''', (cutoff_date,))
+        posting_stats = cursor.fetchone()
+        
+        # Channel type distribution (last 2 days)
+        cursor.execute('''
+            SELECT channel_type, COUNT(*) as count 
+            FROM videos 
+            WHERE published_at >= ? AND is_official_source = 1
+            GROUP BY channel_type
+            ORDER BY count DESC
+        ''', (cutoff_date,))
+        channel_type_stats = dict(cursor.fetchall())
+        
+        # API quota usage for last 7 days
+        cursor.execute('''
+            SELECT DATE(timestamp) as date, SUM(quota_cost) as daily_usage
+            FROM api_quota_log 
+            WHERE DATE(timestamp) >= DATE('now', '-7 days')
+            GROUP BY DATE(timestamp)
+            ORDER BY date DESC
+        ''')
+        quota_history = cursor.fetchall()
+        
+        # Top performing videos (last 2 days)
+        cursor.execute('''
+            SELECT * FROM videos 
+            WHERE published_at >= ?
+            ORDER BY (view_count + like_count * 10) DESC
+            LIMIT 10
+        ''', (cutoff_date,))
+        top_videos = cursor.fetchall()
         
         conn.close()
+        
+        # Calculate quota remaining
+        quota_remaining = self.max_daily_quota - self.api_quota_used
+        quota_percentage = (self.api_quota_used / self.max_daily_quota) * 100
+        
+        # Time until quota reset
+        time_to_reset = self.quota_reset_time - datetime.now()
+        hours_to_reset = int(time_to_reset.total_seconds() // 3600)
+        minutes_to_reset = int((time_to_reset.total_seconds() % 3600) // 60)
         
         return {
             'recent_videos': recent_videos,
             'pending_videos': pending_videos,
-            'stats': dict(stats) if stats else {'total_today': 0, 'auto_posted': 0, 'pending': 0}
+            'category_stats': category_stats,
+            'priority_stats': priority_stats,
+            'source_stats': {
+                'official': source_stats[0] if source_stats else 0,
+                'unofficial': source_stats[1] if source_stats else 0
+            },
+            'posting_stats': {
+                'auto_posted': posting_stats[0] if posting_stats else 0,
+                'manual_posted': posting_stats[1] if posting_stats else 0,
+                'pending': posting_stats[2] if posting_stats else 0
+            },
+            'channel_type_stats': channel_type_stats,
+            'top_videos': top_videos,
+            'quota_info': {
+                'used': self.api_quota_used,
+                'remaining': quota_remaining,
+                'total': self.max_daily_quota,
+                'percentage': quota_percentage,
+                'hours_to_reset': hours_to_reset,
+                'minutes_to_reset': minutes_to_reset
+            },
+            'quota_history': quota_history,
+            'monitoring_days': CONFIG['MONITORING_DAYS'],
+            'auto_post_threshold': CONFIG['AUTO_POST_THRESHOLD'],
+            'official_channels_count': len(self.official_channels)
+        }
+
+    def get_api_quota_status(self):
+        """Get real-time API quota status"""
+        self.reset_daily_quota_if_needed()
+        
+        quota_remaining = self.max_daily_quota - self.api_quota_used
+        quota_percentage = (self.api_quota_used / self.max_daily_quota) * 100
+        
+        time_to_reset = self.quota_reset_time - datetime.now()
+        
+        return {
+            'used': self.api_quota_used,
+            'remaining': quota_remaining,
+            'total': self.max_daily_quota,
+            'percentage': round(quota_percentage, 2),
+            'reset_in_hours': int(time_to_reset.total_seconds() // 3600),
+            'reset_in_minutes': int((time_to_reset.total_seconds() % 3600) // 60),
+            'status': 'critical' if quota_percentage > 90 else 'warning' if quota_percentage > 70 else 'good'
         }
 
 # Initialize monitor
 monitor = TeluguCinemaMonitor()
 
 def background_monitor():
-    """Background monitoring thread"""
+    """Enhanced background monitoring thread"""
     while True:
         try:
-            monitor.run_monitoring_cycle()
+            # Check if it's a good time to run (avoid peak hours)
+            current_hour = datetime.now().hour
+            if 2 <= current_hour <= 6:  # Run during low-traffic hours
+                logger.info("Running scheduled monitoring during off-peak hours")
+                monitor.run_monitoring_cycle()
+            else:
+                # Run regular monitoring
+                monitor.run_monitoring_cycle()
+            
             time.sleep(CONFIG['MONITORING_INTERVAL'])
+            
         except Exception as e:
             logger.error(f"Background monitor error: {e}")
-            time.sleep(300)
+            time.sleep(600)  # Wait 10 minutes on error
 
 # Start background monitoring
-if CONFIG['YOUTUBE_API_KEY']:
-    monitoring_thread = Thread(target=background_monitor, daemon=True)
-    monitoring_thread.start()
+monitoring_thread = Thread(target=background_monitor, daemon=True)
+monitoring_thread.start()
 
 # Flask Routes
 @app.route('/')
+def index():
+    if 'logged_in' not in session:
+        return redirect(url_for('login'))
+    return redirect(url_for('dashboard'))
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        
+        if username == CONFIG['ADMIN_USERNAME'] and password == CONFIG['ADMIN_PASSWORD']:
+            session['logged_in'] = True
+            return redirect(url_for('dashboard'))
+        else:
+            return render_template('login.html', error='Invalid credentials')
+    
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.pop('logged_in', None)
+    return redirect(url_for('login'))
+
+@app.route('/dashboard')
 def dashboard():
-    if 'authenticated' not in session:
-        return render_template('login.html')
+    if 'logged_in' not in session:
+        return redirect(url_for('login'))
+    
     return render_template('dashboard.html')
 
-@app.route('/login', methods=['POST'])
-def login():
-    if request.form.get('password') == CONFIG['ADMIN_PASSWORD']:
-        session['authenticated'] = True
-        return jsonify({'success': True})
-    return jsonify({'success': False})
-
-@app.route('/api/dashboard')
-def api_dashboard():
-    if 'authenticated' not in session:
-        return jsonify({'error': 'Not authenticated'}), 401
-    return jsonify(monitor.get_dashboard_data())
-
-@app.route('/api/approve/<video_id>', methods=['POST'])
-def api_approve(video_id):
-    if 'authenticated' not in session:
+@app.route('/api/dashboard-data')
+def api_dashboard_data():
+    if 'logged_in' not in session:
         return jsonify({'error': 'Not authenticated'}), 401
     
-    conn = psycopg2.connect(CONFIG['DATABASE_URL'], cursor_factory=RealDictCursor)
-    cur = conn.cursor()
-    cur.execute('SELECT * FROM videos WHERE id = %s', (video_id,))
-    video = cur.fetchone()
-    conn.close()
-    
-    if video and monitor.send_to_telegram(dict(video)):
-        return jsonify({'success': True})
-    return jsonify({'success': False})
+    data = monitor.get_dashboard_data()
+    return jsonify(data)
 
-@app.route('/api/manual-check', methods=['POST'])
+@app.route('/api/quota-status')
+def api_quota_status():
+    if 'logged_in' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    quota_status = monitor.get_api_quota_status()
+    return jsonify(quota_status)
+
+@app.route('/api/pending-videos')
+def api_pending_videos():
+    if 'logged_in' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    pending_videos = monitor.get_pending_videos()
+    return jsonify({'pending_videos': pending_videos})
+
+@app.route('/api/recent-videos')
+def api_recent_videos():
+    if 'logged_in' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    recent_videos = monitor.get_recent_videos(CONFIG['MONITORING_DAYS'])
+    return jsonify({'recent_videos': recent_videos})
+
+@app.route('/api/approve-video/<video_id>', methods=['POST'])
+def api_approve_video(video_id):
+    if 'logged_in' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    success, message = monitor.approve_and_send_video(video_id)
+    return jsonify({'success': success, 'message': message})
+
+@app.route('/api/manual-check')
 def api_manual_check():
-    if 'authenticated' not in session:
+    if 'logged_in' not in session:
         return jsonify({'error': 'Not authenticated'}), 401
     
-    Thread(target=monitor.run_monitoring_cycle).start()
-    return jsonify({'success': True, 'message': 'Manual check initiated'})
+    # Check quota before starting
+    quota_status = monitor.get_api_quota_status()
+    if quota_status['percentage'] > 90:
+        return jsonify({
+            'success': False, 
+            'error': 'API quota nearly exhausted. Please wait for reset.'
+        })
+    
+    try:
+        # Run monitoring cycle in background
+        Thread(target=monitor.run_monitoring_cycle).start()
+        return jsonify({'success': True, 'message': 'Manual check initiated'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/config', methods=['GET', 'POST'])
+def api_config():
+    if 'logged_in' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    if request.method == 'POST':
+        data = request.json
+        
+        # Update configuration
+        for key, value in data.items():
+            if key in CONFIG and key not in ['ADMIN_USERNAME', 'ADMIN_PASSWORD']:
+                CONFIG[key] = value
+                
+        return jsonify({'success': True, 'message': 'Configuration updated'})
+    
+    # Return masked sensitive info
+    return jsonify({
+        'youtube_api_key': CONFIG['YOUTUBE_API_KEY'][:10] + '...' if CONFIG['YOUTUBE_API_KEY'] else '',
+        'telegram_bot_token': CONFIG['TELEGRAM_BOT_TOKEN'][:10] + '...' if CONFIG['TELEGRAM_BOT_TOKEN'] else '',
+        'telegram_channel_id': CONFIG['TELEGRAM_CHANNEL_ID'],
+        'monitoring_interval': CONFIG['MONITORING_INTERVAL'],
+        'auto_post_threshold': CONFIG['AUTO_POST_THRESHOLD'],
+        'monitoring_days': CONFIG['MONITORING_DAYS'],
+        'max_results_per_search': CONFIG['MAX_RESULTS_PER_SEARCH']
+    })
+
+@app.route('/api/official-channels')
+def api_official_channels():
+    if 'logged_in' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    return jsonify({
+        'channels': monitor.official_channels,
+        'total_count': len(monitor.official_channels)
+    })
+
+@app.route('/api/bulk-approve', methods=['POST'])
+def api_bulk_approve():
+    if 'logged_in' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    data = request.json
+    video_ids = data.get('video_ids', [])
+    
+    if not video_ids:
+        return jsonify({'success': False, 'error': 'No video IDs provided'})
+    
+    success_count = 0
+    failed_count = 0
+    
+    for video_id in video_ids:
+        success, _ = monitor.approve_and_send_video(video_id)
+        if success:
+            success_count += 1
+        else:
+            failed_count += 1
+        time.sleep(2)  # Rate limiting
+    
+    return jsonify({
+        'success': True,
+        'message': f'Bulk approval completed. Success: {success_count}, Failed: {failed_count}'
+    })
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    print("🎬 Enhanced Telugu Cinema Monitoring System Starting...")
+    print("=" * 60)
+    print("📺 Dashboard: http://localhost:5000")
+    print("🔐 Default Login: admin / password123")
+    print("⚙️  Configure API keys in dashboard or environment variables")
+    print(f"🤖 Auto-posting: Only Priority {CONFIG['AUTO_POST_THRESHOLD']}/5 videos")
+    print(f"📅 Monitoring: Last {CONFIG['MONITORING_DAYS']} days only")
+    print(f"✅ Official Channels: {len(monitor.official_channels)} configured")
+    print("👨‍💼 Manual approval: All other content")
+    print("📊 Real-time API quota monitoring")
+    print("=" * 60)
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
