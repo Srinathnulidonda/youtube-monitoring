@@ -8,6 +8,7 @@ from googleapiclient.discovery import build
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
+import sqlite3
 import re
 from threading import Thread
 import time
@@ -22,9 +23,11 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'telugu_cinema_monitor_2025_secure')
 
-# Enhanced Configuration with Render PostgreSQL support
+# Enhanced Configuration with Render PostgreSQL and SQLite support
 CONFIG = {
     'DATABASE_URL': os.getenv('DATABASE_URL'),  # Render PostgreSQL URL
+    'USE_SQLITE': os.getenv('USE_SQLITE', '1').lower() == '1',  # Default to SQLite for local dev
+    'SQLITE_DB_PATH': os.getenv('SQLITE_DB_PATH', 'telugu_cinema.db'),
     'YOUTUBE_API_KEY': os.getenv('YOUTUBE_API_KEY'),
     'TELEGRAM_BOT_TOKEN': os.getenv('TELEGRAM_BOT_TOKEN'),
     'TELEGRAM_CHANNEL_ID': os.getenv('TELEGRAM_CHANNEL_ID'),
@@ -160,7 +163,109 @@ class EnhancedTeluguCinemaMonitor:
         ]
 
     def init_database(self):
-        """Initialize PostgreSQL database for Render"""
+        """Initialize database (SQLite for local, PostgreSQL for production)"""
+        try:
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                self.init_sqlite_database()
+            else:
+                self.init_postgresql_database()
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
+            raise
+
+    def init_sqlite_database(self):
+        """Initialize SQLite database for local development"""
+        try:
+            conn = sqlite3.connect(CONFIG['SQLITE_DB_PATH'])
+            cursor = conn.cursor()
+            
+            # Create tables (SQLite syntax)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS videos (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    channel_id TEXT,
+                    published_at TEXT NOT NULL,
+                    description TEXT,
+                    thumbnail TEXT,
+                    video_url TEXT,
+                    view_count INTEGER DEFAULT 0,
+                    like_count INTEGER DEFAULT 0,
+                    comment_count INTEGER DEFAULT 0,
+                    category TEXT,
+                    priority INTEGER DEFAULT 1,
+                    is_official_source BOOLEAN DEFAULT 0,
+                    content_quality_score REAL DEFAULT 0,
+                    sent_to_telegram BOOLEAN DEFAULT 0,
+                    admin_approved BOOLEAN DEFAULT 0,
+                    auto_posted BOOLEAN DEFAULT 0,
+                    is_spam BOOLEAN DEFAULT 0,
+                    duplicate_check_hash TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS monitoring_stats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    videos_found INTEGER DEFAULT 0,
+                    auto_posted INTEGER DEFAULT 0,
+                    manual_posted INTEGER DEFAULT 0,
+                    api_calls INTEGER DEFAULT 0,
+                    spam_filtered INTEGER DEFAULT 0,
+                    duplicates_filtered INTEGER DEFAULT 0,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS channel_whitelist (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_id TEXT UNIQUE NOT NULL,
+                    channel_name TEXT NOT NULL,
+                    priority_boost INTEGER DEFAULT 0,
+                    is_verified BOOLEAN DEFAULT 0,
+                    added_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS content_filters (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filter_type TEXT NOT NULL,
+                    keyword TEXT NOT NULL,
+                    category TEXT,
+                    is_active BOOLEAN DEFAULT 1,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Create indexes
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_videos_published_at ON videos(published_at DESC)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_videos_priority ON videos(priority DESC)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_videos_category ON videos(category)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel_id)')
+            
+            # Insert default official channels
+            for channel_handle, data in self.official_channels.items():
+                cursor.execute('''
+                    INSERT OR REPLACE INTO channel_whitelist (channel_id, channel_name, priority_boost, is_verified)
+                    VALUES (?, ?, ?, ?)
+                ''', (channel_handle, data['name'], data['priority_boost'], True))
+            
+            conn.commit()
+            conn.close()
+            logger.info("SQLite database initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize SQLite database: {e}")
+            raise
+
+    def init_postgresql_database(self):
+        """Initialize PostgreSQL database for production"""
         try:
             conn = psycopg2.connect(CONFIG['DATABASE_URL'])
             cursor = conn.cursor()
@@ -221,7 +326,7 @@ class EnhancedTeluguCinemaMonitor:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS content_filters (
                     id SERIAL PRIMARY KEY,
-                    filter_type VARCHAR(20) NOT NULL, -- 'include' or 'exclude'
+                    filter_type VARCHAR(20) NOT NULL,
                     keyword VARCHAR(255) NOT NULL,
                     category VARCHAR(50),
                     is_active BOOLEAN DEFAULT TRUE,
@@ -251,12 +356,15 @@ class EnhancedTeluguCinemaMonitor:
             logger.info("PostgreSQL database initialized successfully")
             
         except Exception as e:
-            logger.error(f"Failed to initialize database: {e}")
+            logger.error(f"Failed to initialize PostgreSQL database: {e}")
             raise
 
     def get_db_connection(self):
         """Get database connection"""
-        return psycopg2.connect(CONFIG['DATABASE_URL'])
+        if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+            return sqlite3.connect(CONFIG['SQLITE_DB_PATH'])
+        else:
+            return psycopg2.connect(CONFIG['DATABASE_URL'])
 
     def init_youtube_api(self):
         """Initialize YouTube API with better error handling"""
@@ -295,11 +403,18 @@ class EnhancedTeluguCinemaMonitor:
             conn = self.get_db_connection()
             cursor = conn.cursor()
             
-            cursor.execute('''
-                SELECT is_verified, priority_boost 
-                FROM channel_whitelist 
-                WHERE channel_id = %s OR LOWER(channel_name) LIKE LOWER(%s)
-            ''', (channel_id, f'%{channel_name}%'))
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                cursor.execute('''
+                    SELECT is_verified, priority_boost 
+                    FROM channel_whitelist 
+                    WHERE channel_id = ? OR LOWER(channel_name) LIKE LOWER(?)
+                ''', (channel_id, f'%{channel_name}%'))
+            else:
+                cursor.execute('''
+                    SELECT is_verified, priority_boost 
+                    FROM channel_whitelist 
+                    WHERE channel_id = %s OR LOWER(channel_name) LIKE LOWER(%s)
+                ''', (channel_id, f'%{channel_name}%'))
             
             result = cursor.fetchone()
             conn.close()
@@ -529,30 +644,50 @@ class EnhancedTeluguCinemaMonitor:
         return unique_videos
 
     def save_videos_to_db(self, videos):
-        """Save videos to PostgreSQL database"""
+        """Save videos to database (SQLite or PostgreSQL)"""
         try:
             conn = self.get_db_connection()
             cursor = conn.cursor()
             
             new_videos = []
+            use_sqlite = CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']
             
             for video in videos:
                 # Check if video already exists
-                cursor.execute('SELECT id FROM videos WHERE id = %s', (video['id'],))
+                if use_sqlite:
+                    cursor.execute('SELECT id FROM videos WHERE id = ?', (video['id'],))
+                else:
+                    cursor.execute('SELECT id FROM videos WHERE id = %s', (video['id'],))
+                    
                 if not cursor.fetchone():
-                    cursor.execute('''
-                        INSERT INTO videos 
-                        (id, title, channel, channel_id, published_at, description, thumbnail, video_url,
-                         view_count, like_count, comment_count, category, priority, is_official_source,
-                         content_quality_score, duplicate_check_hash)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ''', (
-                        video['id'], video['title'], video['channel'], video['channel_id'],
-                        video['published_at'], video['description'], video['thumbnail'], video['video_url'],
-                        video.get('view_count', 0), video.get('like_count', 0), video.get('comment_count', 0),
-                        video['category'], video['priority'], video['is_official_source'],
-                        video['content_quality_score'], video['duplicate_check_hash']
-                    ))
+                    if use_sqlite:
+                        cursor.execute('''
+                            INSERT INTO videos 
+                            (id, title, channel, channel_id, published_at, description, thumbnail, video_url,
+                             view_count, like_count, comment_count, category, priority, is_official_source,
+                             content_quality_score, duplicate_check_hash)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (
+                            video['id'], video['title'], video['channel'], video['channel_id'],
+                            video['published_at'], video['description'], video['thumbnail'], video['video_url'],
+                            video.get('view_count', 0), video.get('like_count', 0), video.get('comment_count', 0),
+                            video['category'], video['priority'], video['is_official_source'],
+                            video['content_quality_score'], video['duplicate_check_hash']
+                        ))
+                    else:
+                        cursor.execute('''
+                            INSERT INTO videos 
+                            (id, title, channel, channel_id, published_at, description, thumbnail, video_url,
+                             view_count, like_count, comment_count, category, priority, is_official_source,
+                             content_quality_score, duplicate_check_hash)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ''', (
+                            video['id'], video['title'], video['channel'], video['channel_id'],
+                            video['published_at'], video['description'], video['thumbnail'], video['video_url'],
+                            video.get('view_count', 0), video.get('like_count', 0), video.get('comment_count', 0),
+                            video['category'], video['priority'], video['is_official_source'],
+                            video['content_quality_score'], video['duplicate_check_hash']
+                        ))
                     new_videos.append(video)
             
             conn.commit()
@@ -651,11 +786,18 @@ class EnhancedTeluguCinemaMonitor:
                 # Update database
                 conn = self.get_db_connection()
                 cursor = conn.cursor()
-                cursor.execute('''
-                    UPDATE videos 
-                    SET sent_to_telegram = TRUE, auto_posted = %s, admin_approved = %s, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = %s
-                ''', (is_auto, not is_auto, video['id']))
+                if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                    cursor.execute('''
+                        UPDATE videos 
+                        SET sent_to_telegram = ?, auto_posted = ?, admin_approved = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    ''', (True, is_auto, not is_auto, video['id']))
+                else:
+                    cursor.execute('''
+                        UPDATE videos 
+                        SET sent_to_telegram = %s, auto_posted = %s, admin_approved = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                    ''', (True, is_auto, not is_auto, video['id']))
                 conn.commit()
                 conn.close()
                 
@@ -724,26 +866,32 @@ class EnhancedTeluguCinemaMonitor:
             logger.error(f"Error in monitoring cycle: {e}")
 
     def update_monitoring_stats(self, videos_found, auto_posted, manual_posted, spam_filtered, duplicates_filtered):
-        """Update monitoring statistics in PostgreSQL"""
+        """Update monitoring statistics in database"""
         try:
             conn = self.get_db_connection()
             cursor = conn.cursor()
             
             today = datetime.now().date()
             
-            # Update or insert today's stats
-            cursor.execute('''
-                INSERT INTO monitoring_stats 
-                (date, videos_found, auto_posted, manual_posted, api_calls, spam_filtered, duplicates_filtered)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (date) DO UPDATE SET
-                videos_found = monitoring_stats.videos_found + EXCLUDED.videos_found,
-                auto_posted = monitoring_stats.auto_posted + EXCLUDED.auto_posted,
-                manual_posted = monitoring_stats.manual_posted + EXCLUDED.manual_posted,
-                api_calls = EXCLUDED.api_calls,
-                spam_filtered = monitoring_stats.spam_filtered + EXCLUDED.spam_filtered,
-                duplicates_filtered = monitoring_stats.duplicates_filtered + EXCLUDED.duplicates_filtered
-            ''', (today, videos_found, auto_posted, manual_posted, self.api_quota_used, spam_filtered, duplicates_filtered))
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                cursor.execute('''
+                    INSERT OR REPLACE INTO monitoring_stats 
+                    (date, videos_found, auto_posted, manual_posted, api_calls, spam_filtered, duplicates_filtered)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (today, videos_found, auto_posted, manual_posted, self.api_quota_used, spam_filtered, duplicates_filtered))
+            else:
+                cursor.execute('''
+                    INSERT INTO monitoring_stats 
+                    (date, videos_found, auto_posted, manual_posted, api_calls, spam_filtered, duplicates_filtered)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (date) DO UPDATE SET
+                    videos_found = monitoring_stats.videos_found + EXCLUDED.videos_found,
+                    auto_posted = monitoring_stats.auto_posted + EXCLUDED.auto_posted,
+                    manual_posted = monitoring_stats.manual_posted + EXCLUDED.manual_posted,
+                    api_calls = EXCLUDED.api_calls,
+                    spam_filtered = monitoring_stats.spam_filtered + EXCLUDED.spam_filtered,
+                    duplicates_filtered = monitoring_stats.duplicates_filtered + EXCLUDED.duplicates_filtered
+                ''', (today, videos_found, auto_posted, manual_posted, self.api_quota_used, spam_filtered, duplicates_filtered))
             
             conn.commit()
             conn.close()
@@ -755,20 +903,34 @@ class EnhancedTeluguCinemaMonitor:
         """Get videos pending manual approval (only from last 2 days)"""
         try:
             conn = self.get_db_connection()
-            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                cursor = conn.cursor(cursor_factory=sqlite3.Row)
+            else:
+                cursor = conn.cursor(cursor_factory=RealDictCursor)
             
             # Only show content from last 2 days
             cutoff_date = datetime.now() - timedelta(days=CONFIG['CONTENT_AGE_LIMIT_DAYS'])
             
-            cursor.execute('''
-                SELECT * FROM videos 
-                WHERE sent_to_telegram = FALSE 
-                AND priority < %s 
-                AND published_at >= %s
-                AND is_spam = FALSE
-                ORDER BY priority DESC, content_quality_score DESC, published_at DESC
-                LIMIT %s
-            ''', (CONFIG['AUTO_POST_THRESHOLD'], cutoff_date, limit))
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                cursor.execute('''
+                    SELECT * FROM videos 
+                    WHERE sent_to_telegram = 0 
+                    AND priority < ? 
+                    AND published_at >= ?
+                    AND is_spam = 0
+                    ORDER BY priority DESC, content_quality_score DESC, published_at DESC
+                    LIMIT ?
+                ''', (CONFIG['AUTO_POST_THRESHOLD'], cutoff_date.isoformat(), limit))
+            else:
+                cursor.execute('''
+                    SELECT * FROM videos 
+                    WHERE sent_to_telegram = FALSE 
+                    AND priority < %s 
+                    AND published_at >= %s
+                    AND is_spam = FALSE
+                    ORDER BY priority DESC, content_quality_score DESC, published_at DESC
+                    LIMIT %s
+                ''', (CONFIG['AUTO_POST_THRESHOLD'], cutoff_date, limit))
             
             videos = cursor.fetchall()
             conn.close()
@@ -783,17 +945,28 @@ class EnhancedTeluguCinemaMonitor:
         """Get recent videos (only from last 2 days)"""
         try:
             conn = self.get_db_connection()
-            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                cursor = conn.cursor(cursor_factory=sqlite3.Row)
+            else:
+                cursor = conn.cursor(cursor_factory=RealDictCursor)
             
             # Only show content from last 2 days
             cutoff_date = datetime.now() - timedelta(days=CONFIG['CONTENT_AGE_LIMIT_DAYS'])
             
-            cursor.execute('''
-                SELECT * FROM videos 
-                WHERE published_at >= %s
-                ORDER BY published_at DESC 
-                LIMIT %s
-            ''', (cutoff_date, limit))
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                cursor.execute('''
+                    SELECT * FROM videos 
+                    WHERE published_at >= ?
+                    ORDER BY published_at DESC 
+                    LIMIT ?
+                ''', (cutoff_date.isoformat(), limit))
+            else:
+                cursor.execute('''
+                    SELECT * FROM videos 
+                    WHERE published_at >= %s
+                    ORDER BY published_at DESC 
+                    LIMIT %s
+                ''', (cutoff_date, limit))
             
             videos = cursor.fetchall()
             conn.close()
@@ -808,9 +981,13 @@ class EnhancedTeluguCinemaMonitor:
         """Approve and send a video manually"""
         try:
             conn = self.get_db_connection()
-            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                cursor = conn.cursor(cursor_factory=sqlite3.Row)
+                cursor.execute('SELECT * FROM videos WHERE id = ?', (video_id,))
+            else:
+                cursor = conn.cursor(cursor_factory=RealDictCursor)
+                cursor.execute('SELECT * FROM videos WHERE id = %s', (video_id,))
             
-            cursor.execute('SELECT * FROM videos WHERE id = %s', (video_id,))
             video_data = cursor.fetchone()
             
             if not video_data:
@@ -821,11 +998,18 @@ class EnhancedTeluguCinemaMonitor:
             
             if self.send_to_telegram(video, is_auto=False):
                 # Update manual posted stats
-                cursor.execute('''
-                    UPDATE monitoring_stats 
-                    SET manual_posted = manual_posted + 1 
-                    WHERE date = CURRENT_DATE
-                ''')
+                if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                    cursor.execute('''
+                        UPDATE monitoring_stats 
+                        SET manual_posted = manual_posted + 1 
+                        WHERE date = ?
+                    ''', (datetime.now().date(),))
+                else:
+                    cursor.execute('''
+                        UPDATE monitoring_stats 
+                        SET manual_posted = manual_posted + 1 
+                        WHERE date = CURRENT_DATE
+                    ''')
                 conn.commit()
                 conn.close()
                 return True, "Video sent successfully"
@@ -843,11 +1027,18 @@ class EnhancedTeluguCinemaMonitor:
             conn = self.get_db_connection()
             cursor = conn.cursor()
             
-            cursor.execute('''
-                UPDATE videos 
-                SET is_spam = TRUE, updated_at = CURRENT_TIMESTAMP 
-                WHERE id = %s
-            ''', (video_id,))
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                cursor.execute('''
+                    UPDATE videos 
+                    SET is_spam = 1, updated_at = CURRENT_TIMESTAMP 
+                    WHERE id = ?
+                ''', (video_id,))
+            else:
+                cursor.execute('''
+                    UPDATE videos 
+                    SET is_spam = TRUE, updated_at = CURRENT_TIMESTAMP 
+                    WHERE id = %s
+                ''', (video_id,))
             
             conn.commit()
             conn.close()
@@ -864,14 +1055,20 @@ class EnhancedTeluguCinemaMonitor:
             conn = self.get_db_connection()
             cursor = conn.cursor()
             
-            cursor.execute('''
-                INSERT INTO channel_whitelist (channel_id, channel_name, priority_boost, is_verified)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (channel_id) DO UPDATE SET
-                channel_name = EXCLUDED.channel_name,
-                priority_boost = EXCLUDED.priority_boost,
-                is_verified = EXCLUDED.is_verified
-            ''', (channel_id, channel_name, priority_boost, True))
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                cursor.execute('''
+                    INSERT OR REPLACE INTO channel_whitelist (channel_id, channel_name, priority_boost, is_verified)
+                    VALUES (?, ?, ?, ?)
+                ''', (channel_id, channel_name, priority_boost, True))
+            else:
+                cursor.execute('''
+                    INSERT INTO channel_whitelist (channel_id, channel_name, priority_boost, is_verified)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (channel_id) DO UPDATE SET
+                    channel_name = EXCLUDED.channel_name,
+                    priority_boost = EXCLUDED.priority_boost,
+                    is_verified = EXCLUDED.is_verified
+                ''', (channel_id, channel_name, priority_boost, True))
             
             conn.commit()
             conn.close()
@@ -886,7 +1083,10 @@ class EnhancedTeluguCinemaMonitor:
         """Get comprehensive dashboard data"""
         try:
             conn = self.get_db_connection()
-            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                cursor = conn.cursor(cursor_factory=sqlite3.Row)
+            else:
+                cursor = conn.cursor(cursor_factory=RealDictCursor)
             
             # Only show content from last 2 days
             cutoff_date = datetime.now() - timedelta(days=CONFIG['CONTENT_AGE_LIMIT_DAYS'])
@@ -898,72 +1098,134 @@ class EnhancedTeluguCinemaMonitor:
             pending_videos = self.get_pending_videos(15)
             
             # Get category statistics (last 2 days)
-            cursor.execute('''
-                SELECT category, COUNT(*) as count 
-                FROM videos 
-                WHERE published_at >= %s
-                GROUP BY category
-                ORDER BY count DESC
-            ''', (cutoff_date,))
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                cursor.execute('''
+                    SELECT category, COUNT(*) as count 
+                    FROM videos 
+                    WHERE published_at >= ?
+                    GROUP BY category
+                    ORDER BY count DESC
+                ''', (cutoff_date.isoformat(),))
+            else:
+                cursor.execute('''
+                    SELECT category, COUNT(*) as count 
+                    FROM videos 
+                    WHERE published_at >= %s
+                    GROUP BY category
+                    ORDER BY count DESC
+                ''', (cutoff_date,))
             category_stats = dict(cursor.fetchall())
             
             # Get priority distribution (last 2 days)
-            cursor.execute('''
-                SELECT priority, COUNT(*) as count 
-                FROM videos 
-                WHERE published_at >= %s
-                GROUP BY priority
-                ORDER BY priority DESC
-            ''', (cutoff_date,))
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                cursor.execute('''
+                    SELECT priority, COUNT(*) as count 
+                    FROM videos 
+                    WHERE published_at >= ?
+                    GROUP BY priority
+                    ORDER BY priority DESC
+                ''', (cutoff_date.isoformat(),))
+            else:
+                cursor.execute('''
+                    SELECT priority, COUNT(*) as count 
+                    FROM videos 
+                    WHERE published_at >= %s
+                    GROUP BY priority
+                    ORDER BY priority DESC
+                ''', (cutoff_date,))
             priority_stats = dict(cursor.fetchall())
             
             # Get posting statistics (today)
-            cursor.execute('''
-                SELECT 
-                    COUNT(CASE WHEN auto_posted = TRUE AND DATE(created_at) = CURRENT_DATE THEN 1 END) as auto_posted,
-                    COUNT(CASE WHEN admin_approved = TRUE AND DATE(created_at) = CURRENT_DATE THEN 1 END) as manual_posted,
-                    COUNT(CASE WHEN sent_to_telegram = FALSE AND priority < %s AND published_at >= %s THEN 1 END) as pending,
-                    COUNT(CASE WHEN is_spam = TRUE AND DATE(created_at) = CURRENT_DATE THEN 1 END) as spam_filtered
-                FROM videos
-            ''', (CONFIG['AUTO_POST_THRESHOLD'], cutoff_date))
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                cursor.execute('''
+                    SELECT 
+                        SUM(CASE WHEN auto_posted = 1 AND DATE(created_at) = ? THEN 1 ELSE 0 END) as auto_posted,
+                        SUM(CASE WHEN admin_approved = 1 AND DATE(created_at) = ? THEN 1 ELSE 0 END) as manual_posted,
+                        SUM(CASE WHEN sent_to_telegram = 0 AND priority < ? AND published_at >= ? THEN 1 ELSE 0 END) as pending,
+                        SUM(CASE WHEN is_spam = 1 AND DATE(created_at) = ? THEN 1 ELSE 0 END) as spam_filtered
+                    FROM videos
+                ''', (datetime.now().date(), datetime.now().date(), CONFIG['AUTO_POST_THRESHOLD'], cutoff_date.isoformat(), datetime.now().date()))
+            else:
+                cursor.execute('''
+                    SELECT 
+                        COUNT(CASE WHEN auto_posted = TRUE AND DATE(created_at) = CURRENT_DATE THEN 1 END) as auto_posted,
+                        COUNT(CASE WHEN admin_approved = TRUE AND DATE(created_at) = CURRENT_DATE THEN 1 END) as manual_posted,
+                        COUNT(CASE WHEN sent_to_telegram = FALSE AND priority < %s AND published_at >= %s THEN 1 END) as pending,
+                        COUNT(CASE WHEN is_spam = TRUE AND DATE(created_at) = CURRENT_DATE THEN 1 END) as spam_filtered
+                    FROM videos
+                ''', (CONFIG['AUTO_POST_THRESHOLD'], cutoff_date))
             
             posting_stats = cursor.fetchone()
             
             # Get monitoring stats for last 7 days
-            cursor.execute('''
-                SELECT * FROM monitoring_stats 
-                WHERE date >= CURRENT_DATE - INTERVAL '7 days'
-                ORDER BY date DESC
-            ''')
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                cursor.execute('''
+                    SELECT * FROM monitoring_stats 
+                    WHERE date >= ?
+                    ORDER BY date DESC
+                ''', ((datetime.now().date() - timedelta(days=7)).isoformat(),))
+            else:
+                cursor.execute('''
+                    SELECT * FROM monitoring_stats 
+                    WHERE date >= CURRENT_DATE - INTERVAL '7 days'
+                    ORDER BY date DESC
+                ''')
             monitoring_stats = cursor.fetchall()
             
             # Get top channels (last 2 days)
-            cursor.execute('''
-                SELECT channel, COUNT(*) as video_count, 
-                       ROUND(AVG(content_quality_score), 2) as avg_quality,
-                       BOOL_OR(is_official_source) as has_official
-                FROM videos 
-                WHERE published_at >= %s
-                GROUP BY channel
-                HAVING COUNT(*) > 1
-                ORDER BY video_count DESC, avg_quality DESC
-                LIMIT 10
-            ''', (cutoff_date,))
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                cursor.execute('''
+                    SELECT channel, COUNT(*) as video_count, 
+                           ROUND(AVG(content_quality_score), 2) as avg_quality,
+                           MAX(is_official_source) as has_official
+                    FROM videos 
+                    WHERE published_at >= ?
+                    GROUP BY channel
+                    HAVING COUNT(*) > 1
+                    ORDER BY video_count DESC, avg_quality DESC
+                    LIMIT 10
+                ''', (cutoff_date.isoformat(),))
+            else:
+                cursor.execute('''
+                    SELECT channel, COUNT(*) as video_count, 
+                           ROUND(AVG(content_quality_score), 2) as avg_quality,
+                           BOOL_OR(is_official_source) as has_official
+                    FROM videos 
+                    WHERE published_at >= %s
+                    GROUP BY channel
+                    HAVING COUNT(*) > 1
+                    ORDER BY video_count DESC, avg_quality DESC
+                    LIMIT 10
+                ''', (cutoff_date,))
             top_channels = cursor.fetchall()
             
             # Get quality distribution
-            cursor.execute('''
-                SELECT 
-                    CASE 
-                        WHEN content_quality_score >= 8 THEN 'High (8-10)'
-                        WHEN content_quality_score >= 5 THEN 'Medium (5-7)'
-                        ELSE 'Low (0-4)'
-                    END as quality_range,
-                    COUNT(*) as count
-                FROM videos 
-                WHERE published_at >= %s
-                GROUP BY quality_range
-            ''', (cutoff_date,))
+            if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+                cursor.execute('''
+                    SELECT 
+                        CASE 
+                            WHEN content_quality_score >= 8 THEN 'High (8-10)'
+                            WHEN content_quality_score >= 5 THEN 'Medium (5-7)'
+                            ELSE 'Low (0-4)'
+                        END as quality_range,
+                        COUNT(*) as count
+                    FROM videos 
+                    WHERE published_at >= ?
+                    GROUP BY quality_range
+                ''', (cutoff_date.isoformat(),))
+            else:
+                cursor.execute('''
+                    SELECT 
+                        CASE 
+                            WHEN content_quality_score >= 8 THEN 'High (8-10)'
+                            WHEN content_quality_score >= 5 THEN 'Medium (5-7)'
+                            ELSE 'Low (0-4)'
+                        END as quality_range,
+                        COUNT(*) as count
+                    FROM videos 
+                    WHERE published_at >= %s
+                    GROUP BY quality_range
+                ''', (cutoff_date,))
             quality_distribution = dict(cursor.fetchall())
             
             conn.close()
@@ -1197,34 +1459,63 @@ def api_stats():
     try:
         # Get detailed statistics
         conn = monitor.get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+            cursor = conn.cursor(cursor_factory=sqlite3.Row)
+        else:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
         
         # Get hourly distribution (last 24 hours)
-        cursor.execute('''
-            SELECT 
-                EXTRACT(HOUR FROM created_at) as hour,
-                COUNT(*) as count
-            FROM videos 
-            WHERE created_at >= NOW() - INTERVAL '24 hours'
-            GROUP BY EXTRACT(HOUR FROM created_at)
-            ORDER BY hour
-        ''')
+        if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+            cursor.execute('''
+                SELECT 
+                    strftime('%H', created_at) as hour,
+                    COUNT(*) as count
+                FROM videos 
+                WHERE created_at >= ?
+                GROUP BY strftime('%H', created_at)
+                ORDER BY hour
+            ''', ((datetime.now() - timedelta(hours=24)).isoformat(),))
+        else:
+            cursor.execute('''
+                SELECT 
+                    EXTRACT(HOUR FROM created_at) as hour,
+                    COUNT(*) as count
+                FROM videos 
+                WHERE created_at >= NOW() - INTERVAL '24 hours'
+                GROUP BY EXTRACT(HOUR FROM created_at)
+                ORDER BY hour
+            ''')
         hourly_stats = cursor.fetchall()
         
         # Get performance metrics
-        cursor.execute('''
-            SELECT 
-                DATE(date) as date,
-                SUM(videos_found) as total_found,
-                SUM(auto_posted) as total_auto_posted,
-                SUM(manual_posted) as total_manual_posted,
-                SUM(spam_filtered) as total_spam_filtered,
-                ROUND(AVG(api_calls), 0) as avg_api_calls
-            FROM monitoring_stats 
-            WHERE date >= CURRENT_DATE - INTERVAL '7 days'
-            GROUP BY DATE(date)
-            ORDER BY date DESC
-        ''')
+        if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+            cursor.execute('''
+                SELECT 
+                    date,
+                    SUM(videos_found) as total_found,
+                    SUM(auto_posted) as total_auto_posted,
+                    SUM(manual_posted) as total_manual_posted,
+                    SUM(spam_filtered) as total_spam_filtered,
+                    ROUND(AVG(api_calls), 0) as avg_api_calls
+                FROM monitoring_stats 
+                WHERE date >= ?
+                GROUP BY date
+                ORDER BY date DESC
+            ''', ((datetime.now().date() - timedelta(days=7)).isoformat(),))
+        else:
+            cursor.execute('''
+                SELECT 
+                    DATE(date) as date,
+                    SUM(videos_found) as total_found,
+                    SUM(auto_posted) as total_auto_posted,
+                    SUM(manual_posted) as total_manual_posted,
+                    SUM(spam_filtered) as total_spam_filtered,
+                    ROUND(AVG(api_calls), 0) as avg_api_calls
+                FROM monitoring_stats 
+                WHERE date >= CURRENT_DATE - INTERVAL '7 days'
+                GROUP BY DATE(date)
+                ORDER BY date DESC
+            ''')
         performance_stats = cursor.fetchall()
         
         conn.close()
@@ -1245,11 +1536,17 @@ def health_check():
         # Check database connection
         conn = monitor.get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT 1')
+        if CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']:
+            cursor.execute('SELECT 1')
+        else:
+            cursor.execute('SELECT 1')
         conn.close()
+        
+        db_type = "SQLite" if (CONFIG['USE_SQLITE'] or not CONFIG['DATABASE_URL']) else "PostgreSQL"
         
         return jsonify({
             'status': 'healthy',
+            'database': db_type,
             'timestamp': datetime.now().isoformat(),
             'api_quota_used': monitor.api_quota_used,
             'monitoring_active': monitoring_thread.is_alive()
@@ -1275,7 +1572,7 @@ if __name__ == '__main__':
     print("🎬 Enhanced Telugu Cinema Monitoring System Starting...")
     print("📺 Dashboard: http://localhost:5000")
     print("🔐 Login with configured credentials")
-    print("⚙️  Using PostgreSQL on Render")
+    print(f"🗄️  Using {'SQLite' if CONFIG['USE_SQLITE'] else 'PostgreSQL'} database")
     print(f"🤖 Auto-posting: Priority {CONFIG['AUTO_POST_THRESHOLD']}/5 and above")
     print(f"📅 Showing content from last {CONFIG['CONTENT_AGE_LIMIT_DAYS']} days")
     print("🎯 Focusing on official sources and quality content")
